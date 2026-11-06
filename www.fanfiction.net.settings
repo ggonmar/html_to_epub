@@ -1,0 +1,48 @@
+# Settings for extracting content from www.fanfiction.net
+# This file defines the CSS selectors and extraction patterns for fanfiction.net
+
+[metadata]
+# CSS selector for the story title
+title_selector = #profile_top b
+
+# CSS selector for the author
+author_selector = #profile_top a[href^="/u/"]
+
+# CSS selector for the chapter select dropdown
+chapter_select_selector = select#chap_select
+
+# CSS selector for the story summary/description
+summary_selector = #profile_top > div.xcontrast_txt
+
+[content]
+# CSS selector for the main story content
+content_selector = #storytext
+
+# CSS selectors for elements to remove from content (comma-separated)
+unwanted_selectors = script, style, iframe, form, button, select
+
+# Attributes to remove from elements in content (comma-separated)
+# Attributes starting with "on" are always removed
+remove_attributes = class, id
+
+[chapter]
+# CSS selector for the selected chapter option
+selected_option_selector = select#chap_select option[selected]
+
+# Regex pattern to clean chapter titles (removes leading numbers)
+# Example: "1. Chapter Title" -> "Chapter Title"
+title_cleanup_pattern = ^\d+\.\s*
+
+# Default chapter title format when no chapter name is found
+# {number} will be replaced with the chapter number
+default_chapter_title = Chapter {number}
+
+[validation]
+# Pattern for page filenames
+page_filename_pattern = page_*.html
+
+# Whether to validate that downloaded chapters match the chapter list
+validate_chapter_list = true
+
+# Whether to verify chapter text hasn't changed after EPUB creation
+verify_content = true

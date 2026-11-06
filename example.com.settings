@@ -1,0 +1,45 @@
+# Example settings file for a hypothetical fanfiction site
+# Replace selectors with appropriate values for your target website
+
+[metadata]
+# CSS selector for the story title
+title_selector = .story-title
+
+# CSS selector for the author name
+author_selector = .author-name
+
+# CSS selector for the chapter select dropdown
+chapter_select_selector = select.chapter-selector
+
+# CSS selector for the story summary/description
+summary_selector = .story-summary
+
+[content]
+# CSS selector for the main story content area
+content_selector = .story-content
+
+# CSS selectors for elements to remove from content (comma-separated)
+unwanted_selectors = script, style, .advertisement, .social-share
+
+# Attributes to remove from elements in content (comma-separated)
+remove_attributes = class, id, data-tracking
+
+[chapter]
+# CSS selector for the selected chapter option
+selected_option_selector = select.chapter-selector option[selected]
+
+# Regex pattern to clean chapter titles (removes leading numbers)
+title_cleanup_pattern = ^\d+\.\s*
+
+# Default chapter title format when no chapter name is found
+default_chapter_title = Chapter {number}
+
+[validation]
+# Pattern for page filenames
+page_filename_pattern = page_*.html
+
+# Whether to validate that downloaded chapters match the chapter list
+validate_chapter_list = true
+
+# Whether to verify chapter text hasn't changed after EPUB creation
+verify_content = true

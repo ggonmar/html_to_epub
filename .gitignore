@@ -1,0 +1,6 @@
+*.jpg
+*.png
+*.epub
+
+# Ignore all directories, including downloaded chapter folders.
+*/

@@ -4,7 +4,7 @@ import io
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from zipfile import ZIP_STORED, ZipFile
 
 from ebooklib import epub
@@ -56,9 +56,145 @@ class ComposeEpubTests(unittest.TestCase):
             self.assertIn(b"cover-image", archive.read("EPUB/content.opf"))
         summary = self.stdout.getvalue()
         self.assertIn(f"EPUB: {result.resolve()}", summary)
-        self.assertIn("Pages: 1 (source chapter pages", summary)
+        self.assertIn("Chapters: 1", summary)
         self.assertRegex(summary, r"Size: \d+\.\d{2} KB")
         self.assertIn("Composing chapters", self.stderr.getvalue())
+
+    def test_ai_description_is_used_when_cover_service_fails(self):
+        with patch.object(
+            compose_epub, "request_ai_description",
+            return_value=("A generated story description.", "A dramatic cover scene.",
+                          "Ollama system prompt.",
+                          "Title: Story\nAuthor: Author\n\nFirst chapter:\n" + "x" * 200),
+        ), patch.object(compose_epub, "generate_comfyui_cover", return_value=None):
+            result = compose_epub.compose(self.folder, self.output, ai=True)
+        book = epub.read_epub(str(result))
+        self.assertEqual(
+            book.get_metadata("DC", "description")[0][0],
+            "A generated story description.",
+        )
+        self.assertEqual(book.get_metadata("OPF", "cover"), [])
+        with ZipFile(result) as archive:
+            self.assertNotIn(b"cover-image", archive.read("EPUB/content.opf"))
+
+    def test_ai_description_and_generated_cover_are_added(self):
+        with patch.object(
+            compose_epub, "request_ai_description",
+            return_value=("A generated story description.", "A dramatic cover scene.",
+                          "Ollama system prompt.",
+                          "Title: Story\nAuthor: Author\n\nFirst chapter:\n" + "x" * 200),
+        ) as request_description, patch.object(
+            compose_epub, "generate_comfyui_cover", return_value=self.cover
+        ) as generate_cover:
+            result = compose_epub.compose(self.folder, self.output, ai=True)
+        self.assertEqual(
+            request_description.call_args.args[0], "Chapter One A short chapter."
+        )
+        comfyui_prompt = generate_cover.call_args.args[0]
+        self.assertIn("A dramatic cover scene.", comfyui_prompt)
+        self.assertIn("spell it exactly: Sample Story", comfyui_prompt)
+        self.assertIn("spell it exactly: Example Author", comfyui_prompt)
+        self.assertEqual(generate_cover.call_args.args[1], self.root / "cover.png")
+        prompts = (self.root / "ai_prompts.txt").read_text(encoding="utf-8")
+        self.assertIn("Ollama system prompt.", prompts)
+        self.assertIn("First chapter:\n" + "x" * 150 + "...", prompts)
+        self.assertNotIn("x" * 151, prompts)
+        self.assertIn("Prompt 1: Ollama", prompts)
+        self.assertIn("Response by Ollama", prompts)
+        self.assertIn("A generated story description.", prompts)
+        self.assertIn("Cover Description:\nA dramatic cover scene.", prompts)
+        self.assertIn(comfyui_prompt, prompts)
+        self.assertIn("Prompt2: ComfyUI", prompts)
+        self.assertIn("Request sent to ComfyUI", prompts)
+        self.assertIn("Response by ComfyUI", prompts)
+        self.assertIn(f"Generated image saved to: {self.cover}", prompts)
+        book = epub.read_epub(str(result))
+        self.assertEqual(
+            book.get_metadata("DC", "description")[0][0],
+            "A generated story description.",
+        )
+        with ZipFile(result) as archive:
+            self.assertIn(b"cover-image", archive.read("EPUB/content.opf"))
+
+    def test_ollama_connection_failure_falls_back_and_composes_epub(self):
+        with patch.object(
+            compose_epub.requests, "post",
+            side_effect=compose_epub.requests.ConnectionError("offline"),
+        ):
+            result = compose_epub.compose(self.folder, self.output, ai=True)
+        book = epub.read_epub(str(result))
+        self.assertIn("A sample synopsis.", book.get_metadata("DC", "description")[0][0])
+        self.assertEqual(book.get_metadata("OPF", "cover"), [])
+        prompts = (self.root / "ai_prompts.txt").read_text(encoding="utf-8")
+        self.assertIn("First chapter:", prompts)
+        self.assertIn("[Not generated]", prompts)
+        self.assertIn("Error: no cover prompt was returned by Ollama.", prompts)
+
+    def test_ollama_description_and_cover_prompt_response(self):
+        response = Mock()
+        response.json.return_value = {"message": {
+            "content": '{"description":"Short description.","cover_prompt":"A bookish scene."}',
+        }}
+        with patch.object(compose_epub.requests, "post", return_value=response) as post:
+            result = compose_epub.request_ai_description(
+                "First chapter text.", "A Story", "An Author", {
+                    "OLLAMA_BASE_URL": "http://ollama:11434/",
+                    "OLLAMA_MODEL": "gemma4:26b",
+                },
+            )
+        description, cover_prompt, system_prompt, user_prompt = result
+        self.assertEqual((description, cover_prompt), ("Short description.", "A bookish scene."))
+        self.assertEqual(post.call_args.args[0], "http://ollama:11434/api/chat")
+        self.assertEqual(post.call_args.kwargs["json"]["model"], "gemma4:26b")
+        self.assertEqual(post.call_args.kwargs["json"]["keep_alive"], 0)
+        self.assertIn("between 100 and 200 words", system_prompt)
+        self.assertIn("First chapter text.", user_prompt)
+
+    def test_comfyui_connection_failure_skips_cover(self):
+        warning = Mock()
+        with patch.object(
+            compose_epub.requests, "post",
+            side_effect=compose_epub.requests.ConnectTimeout("offline"),
+        ) as post, patch.object(compose_epub.time, "sleep"):
+            result = compose_epub.generate_comfyui_cover(
+                "A cover prompt.", self.root / "generated.png", {
+                    "COMFYUI_BASE_URL": "http://comfyui:8188",
+                    "COMFYUI_CHECKPOINT": "sd_xl_base_1.0.safetensors",
+                },
+                warning,
+            )
+        self.assertIsNone(result)
+        self.assertFalse((self.root / "generated.png").exists())
+        self.assertEqual(post.call_count, 4)
+        warning.assert_called_once_with(
+            "Cover image skipped: timed out, retried 3 times."
+        )
+
+    def test_comfyui_generated_png_is_saved(self):
+        queued = Mock()
+        queued.json.return_value = {"prompt_id": "job-1"}
+        history = Mock()
+        history.json.return_value = {"job-1": {
+            "outputs": {"7": {"images": [{
+                "filename": "cover_00001_.png", "subfolder": "", "type": "output",
+            }]}}
+        }}
+        image = Mock(content=(
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+        ))
+        with patch.object(compose_epub.requests, "post", return_value=queued) as post, patch.object(
+            compose_epub.requests, "get", side_effect=[history, image]
+        ) as get:
+            result = compose_epub.generate_comfyui_cover(
+                "A cover prompt.", self.root / "generated.png", {
+                    "COMFYUI_BASE_URL": "http://comfyui:8188",
+                    "COMFYUI_CHECKPOINT": "sd_xl_base_1.0.safetensors",
+                },
+            )
+        self.assertEqual(result, self.root / "generated.png")
+        self.assertEqual(result.read_bytes(), image.content)
+        self.assertEqual(post.call_args.args[0], "http://comfyui:8188/prompt")
+        self.assertEqual(get.call_count, 2)
 
     def test_default_title_and_automatic_output_name(self):
         with contextlib.chdir(self.root):

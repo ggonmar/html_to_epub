@@ -78,6 +78,27 @@ class FetchPagesTests(unittest.TestCase):
         self.assertEqual(self.get.call_args.kwargs["headers"]["Referer"], "https://page.com/xyz")
         self.prompt.assert_not_called()
 
+    def test_single_page_url_preserved_and_saved_as_page_one(self):
+        self.get.return_value = self.response()
+        url = "https://page.com/article?sort=asc#section"
+        for extra in ([], ["--from", "3", "--to", "7"]):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as output:
+                self.get.reset_mock()
+                with patch.object(fetch_pages, "SAVE_FILES", True):
+                    self.assertEqual(fetch_pages.main([
+                        "--url", url, "--folder", output, *extra,
+                    ]), 0)
+                self.get.assert_called_once()
+                self.assertEqual(self.get.call_args.args[0], url)
+                self.assertEqual(
+                    self.get.call_args.kwargs["headers"]["Referer"],
+                    "https://page.com/article",
+                )
+                self.assertEqual(
+                    [page.name for page in Path(output).iterdir()], ["page_0001.html"]
+                )
+        self.sleep.assert_not_called()
+
     def test_url_template_preserves_path_query_and_fragment(self):
         for template in (
             "https://page.com/xyz/NUMBER/whatever/?sort=asc#chapter",
@@ -106,8 +127,6 @@ class FetchPagesTests(unittest.TestCase):
             ["--url", "page.com/NUMBER"],
             ["--url", "ftp://page.com/NUMBER"],
             ["--url", "https://[invalid/NUMBER"],
-            ["--url", "https://page.com/1/whatever"],
-            ["--url", "https://page.com/number/whatever"],
             ["--url", "https://page.com/NUMBER?page=NUMBER"],
             ["--url", "https://NUMBER.page.com/whatever"],
             ["--url", "https://page.com/whatever#NUMBER"],

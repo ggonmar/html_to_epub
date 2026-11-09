@@ -27,18 +27,47 @@ Convert HTML pages from fanfiction websites into properly formatted EPUB ebooks.
 python html_to_epub.py --url "https://www.fanfiction.net/s/123456/NUMBER/My-Story" --from 1 --to 50 --title "My Story"
 ```
 
-Use the literal `NUMBER` placeholder, just as with `fetch_pages.py`. URLs without
-a scheme default to HTTPS. `--url` and `--title` are required; `--from` and `--to`
-default to 1 and 50.
+Use the literal `NUMBER` placeholder for numbered pages, just as with
+`fetch_pages.py`. Without `NUMBER`, the URL is downloaded unchanged as a single
+page (`page_0001.html`), and `--from` and `--to` are ignored. URLs without a scheme
+default to HTTPS. `--url` and `--title` are required; for numbered URLs, `--from`
+and `--to` default to 1 and 50.
 
-Pages are downloaded into the folder named exactly by `--title` in the current
-directory (the title must be a folder name, not a path). Only after the downloader
-finishes successfully does the wrapper run `compose_epub.py` with that folder,
-the supplied title, and the URL's hostname as `--origin`. The resulting EPUB has
-no cover and uses the composer's default output name, e.g. `My Story.epub`.
-Existing downloaded pages are skipped, allowing interrupted downloads to resume.
-A failed download prevents composition; either stage's failure is returned as
 the wrapper's exit code.
+All wrapper output is grouped under `output/<title>/`: downloaded chapter pages
+are kept in `pages/`, generated cover art is `cover.png`, and the EPUB is named
+`<title>.epub`. The title is sanitized for filesystem use. Existing downloaded
+pages are skipped, allowing interrupted downloads to resume. A failed download
+prevents composition; either stage's failure is returned as the wrapper's exit
+code.
+
+AI generation is attempted by default. Ollama is asked for a spoiler-light book
+description of at most 200 words and a visual cover prompt based on the first
+chapter. Both the exact Ollama messages and the resulting ComfyUI prompt are
+saved in `output/<title>/ai_prompts.txt`. `OLLAMA_BASE_URL` and `OLLAMA_MODEL` in
+`open-webui.env` configure the description and image-prompt request to Ollama;
+`COMFYUI_BASE_URL` and `COMFYUI_CHECKPOINT` configure cover generation through
+ComfyUI's API. The example file lists the expected values. Ollama or ComfyUI
+errors are non-fatal: the EPUB is still composed using the site's summary and
+without an AI cover. Use `--no-ai` to skip both requests. Ollama is asked to
+unload the model after its response to free VRAM before ComfyUI runs.
+
+To use a supplied cover with a title folder, the script first updates an EPUB
+already present in `output/<title>/`. If none exists, it recomposes from pages
+saved in `output/<title>/pages` without downloading or running AI:
+
+```bash
+python html_to_epub.py --title "My Story" --image "cover.png" --origin "www.fanfiction.net"
+```
+
+To replace the cover of an existing EPUB in place:
+
+```bash
+python html_to_epub.py --epub "output/My Story/My Story.epub" --image "cover.png"
+```
+
+The `--image` option can also be added to the normal URL command to use that
+image instead of generating a cover.
 
 Run from a directory containing the matching `<hostname>.settings` file, such as
 `www.fanfiction.net.settings`. The wrapper uses the same Python interpreter for
@@ -70,6 +99,24 @@ python compose_epub.py --folder "downloaded_pages" --cover "cover.jpg" --output 
 python compose_epub.py --folder "pages" --origin "archiveofourown.org" --output "story.epub"
 ```
 
+### LessWrong Articles
+
+The included `www.lesswrong.com.settings` extracts the post title, author, and
+article body, excluding comments and site navigation. Each saved post becomes
+one EPUB chapter; linked posts or sequences are not downloaded automatically.
+
+For a single article, pass its URL directly; no range arguments are needed:
+
+```bash
+python html_to_epub.py --url "https://www.lesswrong.com/posts/3375SZNGA5dKHQMie/i-did-this-without-your-knowledge" --title "I Did This Without Your Knowledge"
+```
+
+For HTML already saved as `page_0001.html` in a folder:
+
+```bash
+python compose_epub.py --folder "LessWrong" --origin "www.lesswrong.com" --title "I Did This Without Your Knowledge"
+```
+
 ### Remove or Replace an Existing EPUB's Cover
 
 ```bash
@@ -92,6 +139,7 @@ The system uses `.settings` files to define how to extract content from differen
 ### Pre-configured
 
 - **www.fanfiction.net.settings** - For fanfiction.net
+- **www.lesswrong.com.settings** - For LessWrong posts (without comments)
 
 ### Examples Included
 
@@ -137,10 +185,14 @@ html_to_epub/
 ├── IMPLEMENTATION_SUMMARY.md            # What changed
 ├── CHANGES.md                           # Detailed code changes
 ├── requirements.txt                     # Python dependencies
-└── downloaded_pages/                    # Input HTML pages
-    ├── page_0001.html
-    ├── page_0002.html
-    └── ...
+└── output/
+  └── My Story/
+    ├── My Story.epub
+    ├── ai_prompts.txt              # Ollama request and generated cover prompt
+    ├── cover.png                    # Present when ComfyUI succeeds
+    └── pages/
+      ├── page_0001.html
+      └── ...
 ```
 
 ## Workflow
@@ -153,9 +205,11 @@ Use `fetch_pages.py` to download HTML pages:
 python fetch_pages.py --url "https://www.fanfiction.net/s/123456/NUMBER/My-Story" --from 1 --to 20 --folder "My Story"
 ```
 
-Use an absolute HTTP or HTTPS URL with exactly one literal `NUMBER` placeholder
-in the path or query string. It is replaced with each page number (1 through 50
-by default), preserving the rest of the URL. For example,
+Use an absolute HTTP or HTTPS URL. Without `NUMBER`, only that page is downloaded
+as `page_0001.html`, and `--from` and `--to` are ignored. For numbered pages, use
+exactly one literal `NUMBER` placeholder in the path or query string. It is
+replaced with each page number (1 through 50 by default), preserving the rest of
+the URL. For example,
 `https://page.com/something/NUMBER/whatev` downloads
 `https://page.com/something/1/whatev`, then
 `https://page.com/something/2/whatev`, and so on.

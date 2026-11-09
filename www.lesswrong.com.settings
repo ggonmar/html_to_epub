@@ -1,0 +1,22 @@
+# Settings for extracting LessWrong posts, excluding comments and site navigation.
+
+[metadata]
+title_selector = .PostsPageTitle-root
+author_selector = a.UsersNameDisplay-noColor[href^="/users/"]
+chapter_select_selector = select
+summary_selector = #postContent p
+
+[content]
+content_selector = #postContent
+unwanted_selectors = script, style, iframe, form, button, select
+remove_attributes = class
+
+[chapter]
+selected_option_selector = select option[selected]
+title_cleanup_pattern =
+default_chapter_title = Article {number}
+
+[validation]
+page_filename_pattern = page_*.html
+validate_chapter_list = false
+verify_content = true

@@ -1,5 +1,6 @@
 beautifulsoup4>=4.12,<5
 EbookLib>=0.20,<0.21
 lxml>=5,<7
+python-dotenv>=1,<2
 requests>=2.32,<3
 rich>=13.9,<15

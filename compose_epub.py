@@ -1,15 +1,20 @@
 import argparse
 import configparser
 import hashlib
+import json
 import os
 import posixpath
+import random
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 from zipfile import BadZipFile, ZipFile
 
+from dotenv import dotenv_values
+import requests
 from bs4 import BeautifulSoup
 from ebooklib import epub
 from lxml import etree
@@ -107,7 +112,233 @@ def normalized_text(markup):
     return " ".join(BeautifulSoup(markup, "lxml").stripped_strings)
 
 
-def compose(input_dir, output=None, cover=None, title=None, origin=None):
+def ai_settings():
+    configured = dotenv_values(Path(__file__).with_name("open-webui.env"))
+    return {
+        key: os.environ.get(key) or configured.get(key) or fallback
+        for key, fallback in {
+            "OLLAMA_BASE_URL": "http://localhost:11434",
+            "OLLAMA_MODEL": "gemma4:26b",
+            "COMFYUI_BASE_URL": "http://localhost:8188",
+            "COMFYUI_CHECKPOINT": "sd_xl_base_1.0.safetensors",
+        }.items()
+    }
+
+
+def save_ai_prompts(
+    path, system_prompt, user_prompt, description=None, cover_prompt=None,
+    comfyui_request=None, comfyui_response=None,
+):
+    if path is None:
+        return
+    description = description or "[Not generated]"
+    cover_prompt = cover_prompt or "[Not generated]"
+    comfyui_request = comfyui_request or "[Not sent]"
+    comfyui_response = comfyui_response or "[No response]"
+    chapter_marker = "\n\nFirst chapter:\n"
+    user_prefix, marker, chapter_text = user_prompt.partition(chapter_marker)
+    if marker and len(chapter_text) > 150:
+        chapter_text = chapter_text[:150].rstrip() + "..."
+    logged_user_prompt = f"{user_prefix}{marker}{chapter_text}"
+    content = (
+        "Prompt 1: Ollama\n"
+        "--------------------\n"
+        f"System message:\n{system_prompt}\n\n"
+        f"User message:\n{logged_user_prompt}\n\n"
+        "Response by Ollama\n"
+        "-----------------------\n"
+        "Description:\n"
+        f"{description}\n\n"
+        "Cover Description:\n"
+        f"{cover_prompt}\n\n"
+        "Prompt2: ComfyUI\n"
+        "---------------------\n"
+        "Request sent to ComfyUI:\n"
+        f"{comfyui_request}\n\n"
+        "Response by ComfyUI\n"
+        "------------------------\n"
+        f"{comfyui_response}\n"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def request_ai_description(chapter_text, title, author, settings, warning_callback=None):
+    system_prompt = (
+        "Using only the supplied first chapter, create a faithful, spoiler-light ebook "
+        "description in the same language as the chapter, between 100 and 200 words. "
+        "Also create a detailed, portrait-oriented image-generation prompt for a cover "
+        "that represents the story's setting, characters, mood, and visual details. "
+        "Keep the cover_prompt focused on the illustration; the script will add the exact "
+        "book title and author as typography requirements. Return only the requested JSON fields."
+    )
+    user_prompt = f"Title: {title}\nAuthor: {author}\n\nFirst chapter:\n{chapter_text}"
+    schema = {
+        "type": "object",
+        "properties": {
+            "description": {"type": "string"},
+            "cover_prompt": {"type": "string"},
+        },
+        "required": ["description", "cover_prompt"],
+        "additionalProperties": False,
+    }
+    try:
+        response = requests.post(
+            f"{settings['OLLAMA_BASE_URL'].rstrip('/')}/api/chat",
+            json={
+                "model": settings["OLLAMA_MODEL"],
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "format": schema,
+                "stream": False,
+                "keep_alive": 0,
+            },
+            timeout=300,
+        )
+        response.raise_for_status()
+        result = json.loads(response.json()["message"]["content"])
+        description = result.get("description", "").strip()
+        cover_prompt = result.get("cover_prompt", "").strip()
+        if not description or not cover_prompt:
+            raise ValueError("Ollama returned an empty description or cover prompt")
+        return description, cover_prompt, system_prompt, user_prompt
+    except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+        message = f"Description skipped: Ollama request failed ({exc})."
+        if warning_callback is not None:
+            warning_callback(message)
+        else:
+            print(f"[AI] {message}", file=sys.stderr)
+        return None, None, system_prompt, user_prompt
+
+
+class ComfyUIRequestError(Exception):
+    pass
+
+
+def comfyui_request(request, *args, **kwargs):
+    last_error = None
+    for attempt in range(4):
+        try:
+            return request(*args, **kwargs)
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_error = exc
+            if attempt < 3:
+                time.sleep(0.5)
+    reason = "timed out" if isinstance(last_error, requests.Timeout) else "connection failed"
+    raise ComfyUIRequestError(f"{reason}, retried 3 times") from last_error
+
+
+def cover_generation_prompt(visual_prompt, title, author):
+    return (
+        f"{visual_prompt}\n\n"
+        "Book-cover typography requirements: leave clean, uncluttered space for text. "
+        f"Show the exact book title prominently and spell it exactly: {title}. "
+        f"Show the author's name clearly and spell it exactly: {author}. "
+        "Use readable, high-contrast lettering, with the title near the top and the author "
+        "near the bottom. Do not add any other words or lettering."
+    )
+
+
+def generate_comfyui_cover(prompt, destination, settings, warning_callback=None):
+    base_url = settings["COMFYUI_BASE_URL"].rstrip("/")
+    workflow = {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {
+            "ckpt_name": settings["COMFYUI_CHECKPOINT"],
+        }},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {
+            "text": prompt, "clip": ["1", 1],
+        }},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {
+            "text": "watermark, misspelled words, illegible lettering, low quality, blurry",
+            "clip": ["1", 1],
+        }},
+        "4": {"class_type": "EmptyLatentImage", "inputs": {
+            "width": 832, "height": 1216, "batch_size": 1,
+        }},
+        "5": {"class_type": "KSampler", "inputs": {
+            "seed": random.randrange(0, 2**64), "steps": 25, "cfg": 6.5,
+            "sampler_name": "euler", "scheduler": "normal", "denoise": 1,
+            "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0],
+            "latent_image": ["4", 0],
+        }},
+        "6": {"class_type": "VAEDecode", "inputs": {
+            "samples": ["5", 0], "vae": ["1", 2],
+        }},
+        "7": {"class_type": "SaveImage", "inputs": {
+            "filename_prefix": "html_to_epub/cover", "images": ["6", 0],
+        }},
+    }
+    try:
+        queued = comfyui_request(
+            requests.post, f"{base_url}/prompt", json={"prompt": workflow}, timeout=(5, 15)
+        )
+        queued.raise_for_status()
+        prompt_id = queued.json()["prompt_id"]
+        deadline = time.monotonic() + 300
+        image_info = None
+        while time.monotonic() < deadline:
+            history = comfyui_request(
+                requests.get, f"{base_url}/history/{prompt_id}", timeout=(5, 15)
+            )
+            history.raise_for_status()
+            result = history.json().get(prompt_id, {})
+            for node_output in result.get("outputs", {}).values():
+                images = node_output.get("images", [])
+                if images:
+                    image_info = images[0]
+                    break
+            if image_info is not None:
+                break
+            if result.get("status", {}).get("status_str") == "error":
+                raise ValueError("ComfyUI workflow failed")
+            time.sleep(2)
+        if image_info is None:
+            raise TimeoutError("ComfyUI did not finish generating the cover in time")
+        image = comfyui_request(
+            requests.get,
+            f"{base_url}/view",
+            params={
+                "filename": image_info["filename"],
+                "subfolder": image_info.get("subfolder", ""),
+                "type": image_info.get("type", "output"),
+            },
+            timeout=(5, 60),
+        )
+        image.raise_for_status()
+        if not image.content.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("ComfyUI did not return a PNG cover")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(image.content)
+        return destination
+    except ComfyUIRequestError as exc:
+        message = f"Cover image skipped: {exc}."
+        if warning_callback is not None:
+            warning_callback(message)
+        else:
+            print(f"[AI] {message}", file=sys.stderr)
+        return None
+    except (requests.RequestException, ValueError, KeyError, TypeError, TimeoutError, OSError) as exc:
+        if isinstance(exc, requests.RequestException):
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            detail = f"HTTP {status}" if status is not None else "request failed"
+        elif isinstance(exc, TimeoutError):
+            detail = "generation timed out"
+        else:
+            detail = "workflow failed"
+        message = f"Cover image skipped: {detail}."
+        if warning_callback is not None:
+            warning_callback(message)
+        else:
+            print(f"[AI] {message}", file=sys.stderr)
+        return None
+
+
+def compose(
+    input_dir, output=None, cover=None, title=None, origin=None, ai=False,
+    quiet=False, phase_callback=None, warning_callback=None,
+):
     """
     Compose an EPUB from HTML pages.
 
@@ -140,20 +371,26 @@ def compose(input_dir, output=None, cover=None, title=None, origin=None):
         TextColumn("ETA"),
         TimeRemainingColumn(),
         console=Console(file=sys.stderr),
+        disable=quiet,
     ) as progress:
         output, chapter_count = compose_book(
-            input_dir, output, cover, title, progress, settings
+            input_dir, output, cover, title, progress, settings, ai,
+            phase_callback, warning_callback,
         )
 
     size_kb = output.stat().st_size / 1024
     size = f"{size_kb / 1024:.2f} MB" if size_kb >= 1024 else f"{size_kb:.2f} KB"
-    print(f"EPUB: {output.resolve()}")
-    print(f"Pages: {chapter_count} (source chapter pages; reader pagination varies)")
-    print(f"Size: {size}")
+    if not quiet:
+        print(f"EPUB: {output.resolve()}")
+        print(f"Chapters: {chapter_count}")
+        print(f"Size: {size}")
     return output
 
 
-def compose_book(input_dir, output, cover, title, progress, settings):
+def compose_book(
+    input_dir, output, cover, title, progress, settings, ai=False,
+    phase_callback=None, warning_callback=None,
+):
     metadata_task = progress.add_task("Reading files and metadata", total=1)
     pages = sorted(
         input_dir.glob(settings.page_filename_pattern),
@@ -176,6 +413,78 @@ def compose_book(input_dir, output, cover, title, progress, settings):
         filename = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title).strip().rstrip(". ")
         output = Path(f"{filename}.epub")
     author = author_node.get_text(strip=True)
+    ai_description = None
+    cover_prompt = None
+    ollama_system_prompt = None
+    ollama_user_prompt = None
+    comfyui_request = "[Not sent]"
+    comfyui_response = "[Not requested]"
+    if phase_callback is not None:
+        phase_callback("Composing Description")
+    if ai:
+        first_content = first.select_one(settings.content_selector)
+        if first_content is not None:
+            for unwanted in first_content.select(", ".join(settings.unwanted_selectors)):
+                unwanted.decompose()
+            for element in first_content.find_all(True):
+                for attribute in list(element.attrs):
+                    if attribute.startswith("on") or attribute in settings.remove_attributes:
+                        del element[attribute]
+            chapter_text = normalized_text(str(first_content))
+            if chapter_text:
+                ai_config = ai_settings()
+                ai_description, cover_prompt, ollama_system_prompt, ollama_user_prompt = request_ai_description(
+                    chapter_text, title, author, ai_config, warning_callback
+                )
+            elif warning_callback is not None:
+                warning_callback("AI generation skipped: first chapter text is empty.")
+        elif warning_callback is not None:
+            warning_callback("AI generation skipped: first chapter content was not found.")
+    if phase_callback is not None:
+        phase_callback("Composing Cover Image")
+    if ai and cover is None:
+        if cover_prompt:
+            ai_config = ai_settings()
+            comfyui_prompt = cover_generation_prompt(cover_prompt, title, author)
+            comfyui_request = (
+                f"Prompt: {comfyui_prompt}\n"
+                f"Checkpoint: {ai_config['COMFYUI_CHECKPOINT']}\n"
+                "Resolution: 832 x 1216\n"
+                "Steps: 25"
+            )
+            cover_errors = []
+            cover = generate_comfyui_cover(
+                comfyui_prompt, input_dir.parent / "cover.png", ai_config,
+                cover_errors.append,
+            )
+            if cover is not None:
+                comfyui_response = f"Generated image saved to: {cover}"
+            elif cover_errors:
+                comfyui_response = cover_errors[0]
+                if warning_callback is not None:
+                    warning_callback(cover_errors[0])
+            else:
+                comfyui_response = "Error: ComfyUI returned no image."
+        elif warning_callback is not None:
+            comfyui_response = "Error: no cover prompt was returned by Ollama."
+            warning_callback("Cover image skipped: no prompt was available.")
+        else:
+            comfyui_response = "Error: no cover prompt was returned by Ollama."
+    elif ai and cover is not None:
+        comfyui_request = "[Not sent: a custom cover was supplied]"
+        comfyui_response = f"Using supplied cover: {cover}"
+    if ai:
+        save_ai_prompts(
+            input_dir.parent / "ai_prompts.txt",
+            ollama_system_prompt or "[Ollama prompt unavailable]",
+            ollama_user_prompt or "[First-chapter prompt unavailable]",
+            ai_description,
+            cover_prompt,
+            comfyui_request,
+            comfyui_response,
+        )
+    if phase_callback is not None:
+        phase_callback("Creating Epub")
     chapter_menu = first.select_one(settings.chapter_select_selector)
     options = chapter_menu.select("option") if chapter_menu is not None else []
     expected_numbers = [int(option["value"]) for option in options]
@@ -191,15 +500,17 @@ def compose_book(input_dir, output, cover, title, progress, settings):
     book.add_author(author)
     if cover is not None:
         book.set_cover(cover.name, cover.read_bytes(), create_page=False)
-    summary_node = first.select_one(settings.summary_selector)
-    summary = summary_node.get_text(" ", strip=True) if summary_node is not None else ""
-    book.add_metadata(
-        "DC",
-        "description",
-        f"An unofficial fanfiction by {author}. {summary} "
-        "This fan-written story is not an official publication and is not "
-        "affiliated with or endorsed by the original work's rights holders.",
-    )
+    if ai_description:
+        description = ai_description
+    else:
+        summary_node = first.select_one(settings.summary_selector)
+        summary = summary_node.get_text(" ", strip=True) if summary_node is not None else ""
+        description = (
+            f"An unofficial fanfiction by {author}. {summary} "
+            "This fan-written story is not an official publication and is not "
+            "affiliated with or endorsed by the original work's rights holders."
+        )
+    book.add_metadata("DC", "description", description)
     stylesheet = epub.EpubItem(
         uid="style",
         file_name="style/book.css",
@@ -282,6 +593,8 @@ def compose_book(input_dir, output, cover, title, progress, settings):
         for name in progress.track(xml_files, description="Validating EPUB XML"):
             etree.fromstring(archive.read(name))
 
+    if phase_callback is not None:
+        phase_callback("Complete")
     return output, len(chapters)
 
 
@@ -535,12 +848,18 @@ def main():
         "--origin",
         help="Origin domain for settings file (default: www.fanfiction.net)",
     )
+    parser.add_argument(
+        "--ai", action="store_true", help="Generate metadata and cover with local AI services"
+    )
     args = parser.parse_args()
     if args.epub is not None and (args.title is not None or args.origin is not None):
         parser.error("--title and --origin apply only when composing from HTML")
     try:
         if args.epub is not None:
             edit_cover(args.epub, args.output, args.cover)
+        elif args.ai:
+            compose(args.folder, args.output, args.cover, args.title,
+                    args.origin or "www.fanfiction.net", True)
         else:
             compose(args.folder, args.output, args.cover, args.title,
                     args.origin or "www.fanfiction.net")

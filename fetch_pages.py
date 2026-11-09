@@ -1,10 +1,11 @@
 ﻿#!/usr/bin/env python3
 """
-Download HTML pages from a URL containing NUMBER (default range: 1 to 50).
+Download one HTML page, or numbered pages using NUMBER (default range: 1 to 50).
 
 Usage: python fetch_pages.py --url "https://page.com/xyz/NUMBER/whatever" --from 1 --to 20 --folder "my_pages"
 NUMBER is replaced with each page number. Legacy --base and --trailing
 options remain supported, but cannot be combined with --url.
+Without NUMBER, --url downloads one page and ignores --from and --to.
 The output folder defaults to downloaded_pages; missing directories are created.
 Existing page files in that folder are skipped without making a request.
 Transient failures get up to 3 attempts, waiting N then 2*N seconds
@@ -70,7 +71,7 @@ REQUEST_TIMEOUT = 15
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", help="Absolute URL with one NUMBER placeholder in its path or query")
+    parser.add_argument("--url", help="Absolute URL, optionally with one NUMBER placeholder in its path or query")
     parser.add_argument("--base", help="Legacy base URL, also used as Referer")
     parser.add_argument("--trailing", help="Legacy path after the page number")
     parser.add_argument("--from", dest="start", type=int, default=1)
@@ -92,7 +93,9 @@ def parse_args(argv=None):
                 parser.error("--url must be an absolute HTTP or HTTPS URL")
         except ValueError as exc:
             parser.error(f"Invalid --url URL: {exc}")
-        if args.url.count("NUMBER") != 1 or (
+        if "NUMBER" not in args.url:
+            args.start = args.end = 1
+        elif args.url.count("NUMBER") != 1 or (
             "NUMBER" not in url.path and "NUMBER" not in url.query
         ):
             parser.error("--url must contain exactly one NUMBER placeholder in its path or query")
@@ -124,7 +127,7 @@ def create_url(base_url, trailing, iteration):
     return f"{base_url.rstrip('/')}/{iteration}/{trailing.strip('/')}"
 
 
-def retry_after_seconds(value):
+def retry_after_seconds(value, quiet=False):
     """Parse Retry-After as seconds or an HTTP date."""
     try:
         if value.isdigit():
@@ -134,11 +137,12 @@ def retry_after_seconds(value):
             date = date.replace(tzinfo=timezone.utc)
         return max(0, (date - datetime.now(timezone.utc)).total_seconds())
     except (ValueError, TypeError, OverflowError):
-        print(f"[WARNING] Invalid Retry-After header: {value!r}; using backoff.", file=sys.stderr)
+        if not quiet:
+            print(f"[WARNING] Invalid Retry-After header: {value!r}; using backoff.", file=sys.stderr)
         return 0
 
 
-def request_with_retries(url, headers, timeout, retry_wait):
+def request_with_retries(url, headers, timeout, retry_wait, quiet=False):
     for attempt in range(1, 4):
         wait = retry_wait * 2 ** (attempt - 1)
         try:
@@ -159,24 +163,33 @@ def request_with_retries(url, headers, timeout, retry_wait):
             reason = f"HTTP {response.status_code}"
             retry_after = response.headers.get("Retry-After")
             if retry_after:
-                wait = max(wait, retry_after_seconds(retry_after))
+                wait = max(wait, retry_after_seconds(retry_after, quiet))
             response.close()
-        print(
-            f"[RETRY] {reason} for {url}. Waiting {wait:g}s "
-            f"before attempt {attempt + 1}/3.",
-            file=sys.stderr,
-            flush=True,
-        )
+        if not quiet:
+            print(
+                f"[RETRY] {reason} for {url}. Waiting {wait:g}s "
+                f"before attempt {attempt + 1}/3.",
+                file=sys.stderr,
+                flush=True,
+            )
         time.sleep(wait)
 
 
-def show_progress(progress, task, completed, successful, failed, skipped=0):
-    progress.update(
-        task, completed=completed, successful=successful, failed=failed, skipped=skipped
-    )
+def show_progress(progress, task, completed, successful, failed, skipped=0, description=None):
+    update = {
+        "completed": completed,
+        "successful": successful,
+        "failed": failed,
+        "skipped": skipped,
+    }
+    if description is not None:
+        update["description"] = description
+    progress.update(task, **update)
 
 
-def download_page(url, headers, timeout=REQUEST_TIMEOUT, retry_wait=5, verbose=False):
+def download_page(
+    url, headers, timeout=REQUEST_TIMEOUT, retry_wait=5, verbose=False, quiet=False
+):
     """Download a page from the given URL with detailed error reporting."""
     try:
         if verbose:
@@ -189,7 +202,7 @@ def download_page(url, headers, timeout=REQUEST_TIMEOUT, retry_wait=5, verbose=F
             if COOKIES:
                 print("    Cookies: [REDACTED]", file=sys.stderr)
         
-        response = request_with_retries(url, headers, timeout, retry_wait)
+        response = request_with_retries(url, headers, timeout, retry_wait, quiet)
         
         if verbose and response.status_code != 200:
             print(f"\n  Response Status: {response.status_code} {response.reason}", file=sys.stderr)
@@ -203,6 +216,8 @@ def download_page(url, headers, timeout=REQUEST_TIMEOUT, retry_wait=5, verbose=F
             print(f"  Apparent size: {len(response.content)} bytes", file=sys.stderr)
         
         if response.status_code == 403:
+            if quiet:
+                return None
             print(f"\n[ERROR] HTTP 403 FORBIDDEN - Server rejected the request", file=sys.stderr)
             print(f"   URL: {url}", file=sys.stderr)
             print(f"\n   POSSIBLE CAUSES:", file=sys.stderr)
@@ -229,25 +244,30 @@ def download_page(url, headers, timeout=REQUEST_TIMEOUT, retry_wait=5, verbose=F
         return response.text
         
     except requests.exceptions.Timeout:
-        print(f"[ERROR] Timeout: Request took more than {timeout}s for {url}", file=sys.stderr)
+        if not quiet:
+            print(f"[ERROR] Timeout: Request took more than {timeout}s for {url}", file=sys.stderr)
         return None
     except requests.exceptions.ConnectionError as e:
-        print(f"[ERROR] Connection Error for {url}: {e}", file=sys.stderr)
+        if not quiet:
+            print(f"[ERROR] Connection Error for {url}: {e}", file=sys.stderr)
         return None
     except requests.exceptions.RequestException as e:
-        print(f"[ERROR] Error downloading {url}: {e}", file=sys.stderr)
+        if not quiet:
+            print(f"[ERROR] Error downloading {url}: {e}", file=sys.stderr)
         return None
 
 
-def save_html(html_content, filename, folder):
+def save_html(html_content, filename, folder, quiet=False):
     """Save HTML content to a file."""
     filepath = folder / filename
     try:
         filepath.write_text(html_content, encoding='utf-8')
-        print(f"  [SAVED] {filepath}")
+        if not quiet:
+            print(f"  [SAVED] {filepath}")
         return True
     except IOError as e:
-        print(f"[ERROR] Error saving {filename}: {e}", file=sys.stderr)
+        if not quiet:
+            print(f"[ERROR] Error saving {filename}: {e}", file=sys.stderr)
         return False
 
 
@@ -274,24 +294,25 @@ def main(argv=None):
         return fetch_pages(args, progress)
 
 
-def fetch_pages(args, progress):
+def fetch_pages(args, progress, quiet=False, task=None, failure_callback=None):
     headers = {**HEADERS, "Referer": args.base}
     # Create output directory if saving files
     if SAVE_FILES:
         try:
             args.folder.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            print(f"[ERROR] Cannot create output folder {args.folder}: {e}", file=sys.stderr)
+            if not quiet:
+                print(f"[ERROR] Cannot create output folder {args.folder}: {e}", file=sys.stderr)
             return 1
         if args.verbose:
             print(f"[*] Output directory: {os.path.abspath(args.folder)}\n")
     
-    if args.verbose:
+    if args.verbose and not quiet:
         print(f"[*] Downloading pages from {args.start} to {args.end}...")
         print(f"[*] URL pattern: {args.url}")
         print(f"[*] Delay between requests: {DELAY_BETWEEN_REQUESTS}s")
         print(f"[*] Verbose mode: {args.verbose}\n")
-    else:
+    elif not quiet:
         print(f"Downloading {args.end} pages of {args.folder.resolve().name}...")
     
     successful = 0
@@ -299,7 +320,7 @@ def fetch_pages(args, progress):
     skipped = 0
     first_download = True
     total = args.end - args.start + 1
-    task = progress.add_task(
+    task = task or progress.add_task(
         "Downloading pages", total=total, successful=0, failed=0, skipped=0
     )
     
@@ -307,18 +328,25 @@ def fetch_pages(args, progress):
         filename = f"page_{i:04d}.html"
         if SAVE_FILES and (args.folder / filename).is_file():
             skipped += 1
-            if args.verbose:
+            if args.verbose and not quiet:
                 print(f"[SKIP] Already downloaded: {args.folder / filename}")
-            show_progress(progress, task, i - args.start + 1, successful, failed, skipped)
+            completed = i - args.start + 1
+            show_progress(
+                progress, task, completed, successful, failed, skipped,
+                f"Pages ({completed}/{total})" if quiet else None,
+            )
             continue
 
         url = (
             args.url.replace("NUMBER", str(i))
             if args.trailing is None else create_url(args.base, args.trailing, i)
         )
-        print(f"\n[{i}/{args.end}] Fetching: {url}")
+        if not quiet:
+            print(f"\n[{i}/{args.end}] Fetching: {url}")
         
-        html = download_page(url, headers, retry_wait=args.retry_wait, verbose=args.verbose)
+        html = download_page(
+            url, headers, retry_wait=args.retry_wait, verbose=args.verbose, quiet=quiet
+        )
         if html is None and first_download:
             progress.stop()
             try:
@@ -327,25 +355,31 @@ def fetch_pages(args, progress):
                     "(name=value; name2=value2), or press Enter to abort: "
                 ).strip()
             except (EOFError, KeyboardInterrupt):
-                print("\n[ERROR] Cookie entry cancelled; stopping.", file=sys.stderr)
+                if not quiet:
+                    print("\n[ERROR] Cookie entry cancelled; stopping.", file=sys.stderr)
                 return 1
             if cookie.lower().startswith("cookie:"):
                 cookie = cookie.split(":", 1)[1].strip()
             if not cookie or "\r" in cookie or "\n" in cookie:
-                print("[ERROR] No valid single-line cookie supplied; stopping.", file=sys.stderr)
+                if not quiet:
+                    print("[ERROR] No valid single-line cookie supplied; stopping.", file=sys.stderr)
                 return 1
             headers["Cookie"] = cookie
             progress.start()
-            print("[*] Retrying the first page with the supplied cookie.")
+            if not quiet:
+                print("[*] Retrying the first page with the supplied cookie.")
             html = download_page(url, headers, retry_wait=args.retry_wait, verbose=args.verbose)
             if html is None:
-                print("[ERROR] First page still failed; stopping.", file=sys.stderr)
+                if not quiet:
+                    print("[ERROR] First page still failed; stopping.", file=sys.stderr)
+                if failure_callback is not None:
+                    failure_callback(i)
                 return 1
         first_download = False
         
         if html is not None:
             if SAVE_FILES:
-                if save_html(html, filename, args.folder):
+                if save_html(html, filename, args.folder, quiet):
                     successful += 1
                 else:
                     failed += 1
@@ -355,20 +389,27 @@ def fetch_pages(args, progress):
         else:
             failed += 1
 
-        show_progress(progress, task, i - args.start + 1, successful, failed, skipped)
+        completed = i - args.start + 1
+        show_progress(
+            progress, task, completed, successful, failed, skipped,
+            f"Pages ({completed}/{total})" if quiet else None,
+        )
+        if failed and failure_callback is not None:
+            failure_callback(i)
 
         # Add delay between requests to be respectful
         if i < args.end:
             time.sleep(DELAY_BETWEEN_REQUESTS)
     
-    print(f"\n{'='*50}")
-    print(f"SUMMARY")
-    print(f"{'='*50}")
-    print(f"Successful: {successful}")
-    print(f"Failed: {failed}")
-    print(f"Skipped: {skipped}")
-    print(f"Total: {successful + failed + skipped}")
-    print(f"{'='*50}")
+    if not quiet:
+        print(f"\n{'='*50}")
+        print("SUMMARY")
+        print(f"{'='*50}")
+        print(f"Successful: {successful}")
+        print(f"Failed: {failed}")
+        print(f"Skipped: {skipped}")
+        print(f"Total: {successful + failed + skipped}")
+        print(f"{'='*50}")
     return 1 if failed else 0
 
 
